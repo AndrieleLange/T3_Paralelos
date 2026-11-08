@@ -6,19 +6,19 @@
  *
  * Uso: mpirun -np P ./bs_mpi N [modo] [delta]
  *   N     : tamanho do vetor (10000, 100000, 1000000 ...)
- *   modo  : 0 = D&C simples (padrao)  1 = D&C com balanceamento de carga
+ *   modo  : 0 = D&C simples (padrao)  1 = versao do artigo (balanceada)
  *   delta : (modo 0) tamanho maximo de vetor que e' conquistado (ordenado)
  *           localmente. Padrao: N / numero_de_folhas, ou seja, a arvore
  *           desce ate' usar todos os P processos (P = 2^k - 1).
  *
  * Modo 0: nos internos apenas dividem e intercalam (ficam ociosos enquanto
  *         esperam os filhos); so' as folhas ordenam com bubble sort.
- * Modo 1: cada no ordena (bubble sort) uma fatia de n/s elementos, onde s e'
- *         o numero de processos da sua subarvore; o restante e' repartido
- *         entre os filhos proporcionalmente ao tamanho de suas subarvores.
- *         Assim todos os processos ordenam a mesma quantidade (N/P) e
- *         nenhum fica ocioso. Como o custo e' quadratico, isso reduz muito
- *         o tempo do caminho critico.
+ * Modo 1: versao do artigo (Radenski, "MPI recursive merge sort", GPL v2+),
+ *         adaptada para usar o bubble sort sequencial nas folhas. Arvore
+ *         binomial: o processo r, no nivel L, entrega a segunda metade do seu
+ *         vetor ao ajudante r + 2^L e segue recursivamente com a primeira metade;
+ *         quando nao ha mais ajudante, ordena com bs. Com p = 2^k cada processo
+ *         ordena N/p elementos; com p = 2^k - 1 a carga fica desigual.
  *
  * Compilar: mpicc -O2 -o bs_mpi bs_mpi.c
  * Defina -DDEBUG para imprimir os vetores (apenas com N pequeno).
@@ -70,11 +70,15 @@ static void merge(const int *a, int na, const int *b, int nb, int *out)
     while (j < nb) out[k++] = b[j++];
 }
 
-/* numero de processos da subarvore com raiz r */
-static int subtree_size(int r)
+/* Avisa os filhos (mensagem vazia) que nao havera trabalho para eles, para nao
+ * ficarem bloqueados em MPI_Probe. Necessario no modo 0 quando um no conquista
+ * sozinho (p que nao e' 2^k - 1, ou delta grande). */
+static void release_children(void)
 {
-    if (r >= nprocs) return 0;
-    return 1 + subtree_size(2 * r + 1) + subtree_size(2 * r + 2);
+    int c, dummy = 0;
+    for (c = 2 * rank + 1; c <= 2 * rank + 2; c++)
+        if (c < nprocs)
+            MPI_Send(&dummy, 0, MPI_INT, c, TAG, MPI_COMM_WORLD);
 }
 
 /* ---------- Modo 0: divisao e conquista simples ---------- */
@@ -84,6 +88,7 @@ static void dc_simple(int *v, int n)
 
     /* conquista: vetor pequeno o bastante ou nao ha' dois filhos */
     if (n <= delta || right >= nprocs) {
+        release_children();
         bs_timed(n, v);
         return;
     }
@@ -105,45 +110,36 @@ static void dc_simple(int *v, int n)
     free(aux);
 }
 
-/* ---------- Modo 1: divisao e conquista com balanceamento ---------- */
-static void dc_balanced(int *v, int n)
-{
-    int left = 2 * rank + 1, right = 2 * rank + 2;
-    int s  = subtree_size(rank);
-    int sl = subtree_size(left), sr = subtree_size(right);
+/* ---------- Modo 1: versao do artigo (arvore binomial) ----------
+ * Adaptado de mpi_mergesort.c, Copyright (C) 2011 Atanas Radenski (GPL v2+).
+ * Mudancas: ordenador sequencial = bubble sort; envio MPI_Send bloqueante no
+ * lugar de MPI_Isend + MPI_Request_free (envio nao bloqueante seguido de calculo atrasava os filhos entre nos). */
 
-    if (s == 1) {            /* folha: ordena tudo */
+/* nivel mais alto da arvore em que o processo r participa (raiz: 0) */
+static int topmost_level(int r)
+{
+    int l = 0;
+    while ((1 << l) <= r) l++;
+    return l;
+}
+
+static void dc_article(int *v, int n, int level)
+{
+    int helper = rank + (1 << level);
+
+    if (helper >= nprocs) {          /* sem ajudantes: conquista */
         bs_timed(n, v);
         return;
     }
+    int half = n / 2;
+    MPI_Send(v + half, n - half, MPI_INT, helper, TAG, MPI_COMM_WORLD);
+    dc_article(v, half, level + 1);  /* primeira metade, recursivamente */
+    MPI_Recv(v + half, n - half, MPI_INT, helper, TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
-    /* fatia propria + fatias dos filhos proporcionais as subarvores */
-    int own = n / s;
-    int rest = n - own;
-    int nl = (int)((long)rest * sl / (s - 1));
-    int nr = rest - nl;      /* nr == 0 se nao ha' filho direito */
-
-    MPI_Request req[2];
-    int nreq = 0;
-    MPI_Isend(v + own, nl, MPI_INT, left, TAG, MPI_COMM_WORLD, &req[nreq++]);
-    if (sr > 0)
-        MPI_Isend(v + own + nl, nr, MPI_INT, right, TAG, MPI_COMM_WORLD, &req[nreq++]);
-
-    bs_timed(own, v);        /* trabalha enquanto os filhos trabalham */
-
-    MPI_Waitall(nreq, req, MPI_STATUSES_IGNORE);
-    MPI_Recv(v + own, nl, MPI_INT, left, TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-    if (sr > 0)
-        MPI_Recv(v + own + nl, nr, MPI_INT, right, TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-
-    /* intercalacao das tres partes ordenadas */
-    int *t1 = malloc(sizeof(int) * (own + nl));
-    int *t2 = malloc(sizeof(int) * n);
-    merge(v, own, v + own, nl, t1);
-    merge(t1, own + nl, v + own + nl, nr, t2);
-    memcpy(v, t2, sizeof(int) * n);
-    free(t1);
-    free(t2);
+    int *aux = malloc(sizeof(int) * n);
+    merge(v, half, v + half, n - half, aux);
+    memcpy(v, aux, sizeof(int) * n);
+    free(aux);
 }
 
 int main(int argc, char **argv)
@@ -158,6 +154,7 @@ int main(int argc, char **argv)
     delta = (argc > 3) ? atoi(argv[3]) : (N + leaves - 1) / leaves;
 
     int *vetor = NULL, n = 0;
+    int parent = (rank - 1) / 2;   /* pai na arvore (modo 2: descoberto no Probe) */
     double t_start = 0.0, t_total = 0.0, t_proc0 = MPI_Wtime();
 
     if (rank == 0) {
@@ -174,21 +171,27 @@ int main(int argc, char **argv)
     } else {
         MPI_Barrier(MPI_COMM_WORLD);
         /* recebe o vetor do pai; tamanho descoberto via Probe */
-        int parent = (rank - 1) / 2;
         MPI_Status st;
-        MPI_Probe(parent, TAG, MPI_COMM_WORLD, &st);
+        MPI_Probe(mode == 1 ? MPI_ANY_SOURCE : parent, TAG, MPI_COMM_WORLD, &st);
+        parent = st.MPI_SOURCE;
         MPI_Get_count(&st, MPI_INT, &n);
         vetor = malloc(sizeof(int) * (n > 0 ? n : 1));
         MPI_Recv(vetor, n, MPI_INT, parent, TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
     }
 
+    /* modo 0: mensagem vazia = sem trabalho; repassa o aviso aos filhos e nao
+     * devolve nada ao pai (que nao espera resposta) */
+    int liberado = (mode == 0 && rank != 0 && n == 0);
+    if (liberado) release_children();
+
     double t_work0 = MPI_Wtime();
-    if (mode == 0) dc_simple(vetor, n);
-    else           dc_balanced(vetor, n);
+    if (liberado)       ;
+    else if (mode == 0) dc_simple(vetor, n);
+    else                dc_article(vetor, n, topmost_level(rank));
     double t_work = MPI_Wtime() - t_work0;
 
-    if (rank != 0) {   /* devolve o vetor ordenado ao pai */
-        MPI_Send(vetor, n, MPI_INT, (rank - 1) / 2, TAG, MPI_COMM_WORLD);
+    if (rank != 0 && !liberado) {   /* devolve o vetor ordenado ao pai */
+        MPI_Send(vetor, n, MPI_INT, parent, TAG, MPI_COMM_WORLD);
     }
 
     /* estatisticas por processo para analise de balanceamento */
@@ -218,6 +221,7 @@ int main(int argc, char **argv)
             for (int r = 0; r < nprocs; r++) {
                 int lvl = 0, x = r + 1;
                 while (x > 1) { x >>= 1; lvl++; }
+                if (mode == 1) lvl = topmost_level(r);   /* nivel de entrada na arvore binomial */
                 printf("%4d %5d %9.4f %10.4f\n", r, lvl, all[2*r], all[2*r+1]);
             }
         }
